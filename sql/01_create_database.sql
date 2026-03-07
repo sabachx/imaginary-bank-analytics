@@ -1,345 +1,743 @@
--- ============================================
--- IMAGINARY BANK - Complete Database Script
--- SQL Server 2025 Express Compatible
--- ============================================
+/* =========================================================
+   IMAGINARY BANK ANALYTICS DATASET v4.0
+   Author: Saba Chkhaidze
 
+   Architecture : Single fact table, star schema
+   Grain        : One row = one month-end financial entry per
+                  branch x segment x product x currency
+                  x scenario x budget_item
+
+   Key improvements over v3:
+   - Realistic product-segment combinations only
+   - Realistic currency distribution (GEL 60%, USD 25%, EUR 15%)
+   - Inserts batched by scenario to avoid memory pressure
+   - YoY growth + seasonality + random variance baked in
+   - Daily averages realistically differ from month-end values
+   ========================================================= */
+
+-------------------------------------------------------------
+-- 1. CREATE DATABASE
+-------------------------------------------------------------
 USE master;
 GO
 
--- Create Database
-IF EXISTS (SELECT name FROM sys.databases WHERE name = 'ImaginaryBank')
+IF DB_ID('ImaginaryBank') IS NOT NULL
+BEGIN
+    ALTER DATABASE ImaginaryBank SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
     DROP DATABASE ImaginaryBank;
+END
 GO
 
 CREATE DATABASE ImaginaryBank;
 GO
-
 USE ImaginaryBank;
 GO
 
--- ============================================
--- TABLE 1: BRANCHES
--- ============================================
-CREATE TABLE branches (
-    branch_id       INT PRIMARY KEY,
-    branch_name     NVARCHAR(100),
-    city            NVARCHAR(50),
-    region          NVARCHAR(50),
-    opened_date     DATE,
-    manager_name    NVARCHAR(100),
-    is_active       BIT
-);
-
-INSERT INTO branches VALUES
-(1, 'Rustaveli Branch',   'Tbilisi',  'Central',  '2018-03-01', 'Nino Kalandadze',  1),
-(2, 'Vake Branch',        'Tbilisi',  'West',     '2019-06-15', 'Giorgi Beridze',   1),
-(3, 'Batumi Main Branch', 'Batumi',   'Adjara',   '2018-09-01', 'Tamar Mchedlidze', 1),
-(4, 'Kutaisi Branch',     'Kutaisi',  'Imereti',  '2020-01-10', 'Levan Sturua',     1),
-(5, 'Rustavi Branch',     'Rustavi',  'Kvemo Kartli', '2021-05-20', 'Ana Jibuti',   1);
-GO
-
--- ============================================
--- TABLE 2: CUSTOMERS
--- ============================================
-CREATE TABLE customers (
-    customer_id     INT PRIMARY KEY,
-    first_name      NVARCHAR(50),
-    last_name       NVARCHAR(50),
-    gender          CHAR(1),
-    birth_date      DATE,
-    email           NVARCHAR(100),
-    phone           NVARCHAR(20),
-    city            NVARCHAR(50),
-    segment         NVARCHAR(20),  -- Retail, SME, Corporate
-    branch_id       INT FOREIGN KEY REFERENCES branches(branch_id),
-    joined_date     DATE,
-    is_active       BIT
+-- =========================================================
+-- 2. dim_date
+-- Full calendar 2022-01-01 to 2026-12-31
+-- date_id format: YYYYMMDD integer
+-- =========================================================
+CREATE TABLE dim_date (
+    date_id      INT          NOT NULL PRIMARY KEY,
+    full_date    DATE         NOT NULL,
+    year         INT          NOT NULL,
+    quarter      INT          NOT NULL,
+    quarter_name VARCHAR(6)   NOT NULL,
+    month        INT          NOT NULL,
+    month_name   VARCHAR(12)  NOT NULL,
+    day          INT          NOT NULL,
+    is_month_end BIT          NOT NULL DEFAULT 0,
+    is_weekend   BIT          NOT NULL DEFAULT 0,
+    is_holiday   BIT          NOT NULL DEFAULT 0
 );
 GO
 
--- Generate 2000 customers using a numbers trick
-WITH nums AS (
-    SELECT TOP 2000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
-    FROM sys.objects a CROSS JOIN sys.objects b
-),
-names AS (
-    SELECT n,
-        CASE (n % 10)
-            WHEN 0 THEN 'Giorgi'   WHEN 1 THEN 'Nino'
-            WHEN 2 THEN 'Luka'     WHEN 3 THEN 'Mariam'
-            WHEN 4 THEN 'David'    WHEN 5 THEN 'Tamar'
-            WHEN 6 THEN 'Levan'    WHEN 7 THEN 'Ana'
-            WHEN 8 THEN 'Irakli'   ELSE 'Salome'
-        END AS first_name,
-        CASE (n % 8)
-            WHEN 0 THEN 'Beridze'    WHEN 1 THEN 'Kalandadze'
-            WHEN 2 THEN 'Sturua'     WHEN 3 THEN 'Jibuti'
-            WHEN 4 THEN 'Mchedlidze' WHEN 5 THEN 'Kvaratskhelia'
-            WHEN 6 THEN 'Chikvanaia' ELSE 'Lomidze'
-        END AS last_name,
-        CASE WHEN n % 2 = 0 THEN 'M' ELSE 'F' END AS gender,
-        DATEADD(DAY, -(n * 7 + 8000), GETDATE()) AS birth_date,
-        CASE (n % 5)
-            WHEN 0 THEN 'Tbilisi' WHEN 1 THEN 'Batumi'
-            WHEN 2 THEN 'Kutaisi' WHEN 3 THEN 'Rustavi'
-            ELSE 'Tbilisi'
-        END AS city,
-        CASE WHEN n % 10 < 7 THEN 'Retail'
-             WHEN n % 10 < 9 THEN 'SME'
-             ELSE 'Corporate'
-        END AS segment,
-        (n % 5) + 1 AS branch_id,
-        DATEADD(DAY, -(n * 3 + 100), GETDATE()) AS joined_date
-    FROM nums
-)
-INSERT INTO customers
-SELECT
-    n AS customer_id,
-    first_name,
-    last_name,
-    gender,
-    CAST(birth_date AS DATE),
-    LOWER(first_name) + '.' + LOWER(last_name) + CAST(n AS NVARCHAR) + '@email.ge' AS email,
-    '+995 5' + RIGHT('00' + CAST((n * 17) % 100 AS VARCHAR), 2) + ' ' +
-              RIGHT('000' + CAST((n * 31) % 1000 AS VARCHAR), 3) + ' ' +
-              RIGHT('000' + CAST((n * 53) % 1000 AS VARCHAR), 3) AS phone,
-    city,
-    segment,
-    branch_id,
-    CAST(joined_date AS DATE),
-    CASE WHEN n % 20 = 0 THEN 0 ELSE 1 END AS is_active
-FROM names;
+DECLARE @d   DATE = '2022-01-01';
+DECLARE @end DATE = '2026-12-31';
+WHILE @d <= @end
+BEGIN
+    INSERT INTO dim_date VALUES (
+        CAST(FORMAT(@d,'yyyyMMdd') AS INT),
+        @d,
+        YEAR(@d),
+        DATEPART(QUARTER,@d),
+        'Q' + CAST(DATEPART(QUARTER,@d) AS VARCHAR),
+        MONTH(@d),
+        DATENAME(MONTH,@d),
+        DAY(@d),
+        CASE WHEN @d = EOMONTH(@d) THEN 1 ELSE 0 END,
+        CASE WHEN DATEPART(WEEKDAY,@d) IN (1,7) THEN 1 ELSE 0 END,
+        0
+    );
+    SET @d = DATEADD(DAY,1,@d);
+END
 GO
 
--- ============================================
--- TABLE 3: ACCOUNTS
--- ============================================
-CREATE TABLE accounts (
-    account_id      INT PRIMARY KEY,
-    customer_id     INT FOREIGN KEY REFERENCES customers(customer_id),
-    account_type    NVARCHAR(20),   -- Checking, Savings, Credit, Loan
-    currency        CHAR(3),        -- GEL, USD, EUR
-    opened_date     DATE,
-    balance         DECIMAL(18,2),
-    credit_limit    DECIMAL(18,2),
-    is_active       BIT
+-- =========================================================
+-- 3. dim_branch
+-- =========================================================
+CREATE TABLE dim_branch (
+    branch_id    INT          NOT NULL PRIMARY KEY,
+    branch_name  VARCHAR(100) NOT NULL,
+    branch_type  VARCHAR(30)  NOT NULL,  -- Flagship/Standard/Mini/Digital
+    city         VARCHAR(50)  NOT NULL,
+    region       VARCHAR(50)  NOT NULL,
+    opened_date  DATE,
+    manager_name VARCHAR(100),
+    is_active    BIT          NOT NULL DEFAULT 1
+);
+
+INSERT INTO dim_branch VALUES
+( 1,'Rustaveli Flagship', 'Flagship','Tbilisi','Central Tbilisi','2018-03-01','Nino Kalandadze',     1),
+( 2,'Vake Branch',        'Standard','Tbilisi','West Tbilisi',   '2019-06-15','Giorgi Beridze',      1),
+( 3,'Saburtalo Branch',   'Standard','Tbilisi','North Tbilisi',  '2020-02-10','Lika Dgebuadze',      1),
+( 4,'Isani Branch',       'Mini',    'Tbilisi','East Tbilisi',   '2021-08-01','Davit Tsereteli',     1),
+( 5,'Batumi Flagship',    'Flagship','Batumi', 'Adjara',         '2018-09-01','Tamar Mchedlidze',    1),
+( 6,'Batumi City Branch', 'Standard','Batumi', 'Adjara',         '2022-01-15','Mariam Kobaidze',     1),
+( 7,'Kutaisi Main',       'Standard','Kutaisi','Imereti',        '2020-01-10','Levan Sturua',        1),
+( 8,'Rustavi Branch',     'Standard','Rustavi','Kvemo Kartli',   '2021-05-20','Ana Jibuti',          1),
+( 9,'Gori Branch',        'Mini',    'Gori',  'Shida Kartli',   '2022-06-01','Irakli Lomidze',      1),
+(10,'Digital Branch',     'Digital', 'Online','Nationwide',     '2023-01-01','Salome Kvaratskhelia',1);
+GO
+
+-- =========================================================
+-- 4. dim_segment
+-- =========================================================
+CREATE TABLE dim_segment (
+    segment_id   INT         NOT NULL PRIMARY KEY,
+    segment_name VARCHAR(30) NOT NULL,
+    description  VARCHAR(200)
+);
+
+INSERT INTO dim_segment VALUES
+(1,'Retail',                'Individual customers, personal banking'),
+(2,'SME',                   'Small and medium enterprises'),
+(3,'Corporate',             'Large corporate clients'),
+(4,'Private Banking',       'High net worth individuals'),
+(5,'Financial Institutions','Banks and financial entities');
+GO
+
+-- =========================================================
+-- 5. dim_product
+-- =========================================================
+CREATE TABLE dim_product (
+    product_id          INT          NOT NULL PRIMARY KEY,
+    product_name        VARCHAR(100) NOT NULL,
+    product_category    VARCHAR(50)  NOT NULL,
+    product_subcategory VARCHAR(50),
+    is_active           BIT          NOT NULL DEFAULT 1
+);
+
+INSERT INTO dim_product VALUES
+( 1,'Consumer Loan',       'Loan',   'Unsecured', 1),
+( 2,'Mortgage',            'Loan',   'Secured',   1),
+( 3,'Auto Loan',           'Loan',   'Secured',   1),
+( 4,'Business Loan',       'Loan',   'Unsecured', 1),
+( 5,'SME Credit Line',     'Loan',   'Revolving', 1),
+( 6,'Corporate Loan',      'Loan',   'Secured',   1),
+( 7,'Credit Card Classic', 'Card',   'Credit',    1),
+( 8,'Credit Card Premium', 'Card',   'Credit',    1),
+( 9,'Debit Card',          'Card',   'Debit',     1),
+(10,'Current Account GEL', 'Deposit','Current',   1),
+(11,'Current Account USD', 'Deposit','Current',   1),
+(12,'Current Account EUR', 'Deposit','Current',   1),
+(13,'Savings Account',     'Deposit','Savings',   1),
+(14,'Term Deposit GEL',    'Deposit','Term',      1),
+(15,'Term Deposit USD',    'Deposit','Term',      1),
+(16,'Internet Banking',    'Service','Digital',   1),
+(17,'Mobile Banking',      'Service','Digital',   1);
+GO
+
+-- =========================================================
+-- 6. dim_currency
+-- =========================================================
+CREATE TABLE dim_currency (
+    currency_id     INT        NOT NULL PRIMARY KEY,
+    currency_code   CHAR(3)    NOT NULL,
+    currency_name   VARCHAR(50) NOT NULL,
+    currency_symbol VARCHAR(5)  NOT NULL,
+    fx_rate_to_gel  DECIMAL(10,6) NOT NULL  -- approximate rate
+);
+
+INSERT INTO dim_currency VALUES
+(1,'GEL','Georgian Lari','₾',1.000000),
+(2,'USD','US Dollar',   '$',2.670000),
+(3,'EUR','Euro',        '€',2.900000);
+GO
+
+-- =========================================================
+-- 7. dim_scenario
+-- =========================================================
+CREATE TABLE dim_scenario (
+    scenario_id   INT         NOT NULL PRIMARY KEY,
+    scenario_name VARCHAR(50) NOT NULL,
+    scenario_type VARCHAR(30) NOT NULL,
+    fiscal_year   INT         NOT NULL,
+    description   VARCHAR(200)
+);
+
+INSERT INTO dim_scenario VALUES
+(1,'Actual_2022',     'Actual',  2022,'Audited actuals FY2022'),
+(2,'Actual_2023',     'Actual',  2023,'Audited actuals FY2023'),
+(3,'Actual_2024',     'Actual',  2024,'Actuals FY2024'),
+(4,'Budget_2023',     'Budget',  2023,'Approved budget FY2023'),
+(5,'Budget_2024',     'Budget',  2024,'Approved budget FY2024'),
+(6,'Budget_2025',     'Budget',  2025,'Approved budget FY2025'),
+(7,'Forecast_Q3_2024','Forecast',2024,'Rolling forecast Q3 2024'),
+(8,'Forecast_Q4_2024','Forecast',2024,'Rolling forecast Q4 2024'),
+(9,'Stress_Test_2024','Stress',  2024,'Adverse scenario stress test');
+GO
+
+-- =========================================================
+-- 8. dim_budget_items
+-- Full P&L and BS hierarchy
+-- parent_item_id = NULL = top level node
+-- is_subtotal = 1 = calculated in DAX, no data rows
+-- =========================================================
+CREATE TABLE dim_budget_items (
+    budget_item_id  INT          NOT NULL PRIMARY KEY,
+    item_name       VARCHAR(100) NOT NULL,
+    statement_type  VARCHAR(5)   NOT NULL,  -- PL or BS
+    category        VARCHAR(50)  NOT NULL,
+    subcategory     VARCHAR(50),
+    parent_item_id  INT          REFERENCES dim_budget_items(budget_item_id),
+    sort_order      INT          NOT NULL,
+    is_subtotal     BIT          NOT NULL DEFAULT 0,
+    sign_convention INT          NOT NULL DEFAULT 1  -- 1=positive good, -1=positive is cost
+);
+
+INSERT INTO dim_budget_items VALUES
+-- ── P&L ──────────────────────────────────────────────────
+( 1,'Net Interest Income',           'PL','Income', 'NII',         NULL, 10,1, 1),
+( 2,'Interest Income',               'PL','Income', 'NII',            1, 11,1, 1),
+( 3,'Interest Income on Loans',      'PL','Income', 'NII',            2, 12,0, 1),
+( 4,'Interest Income on Securities', 'PL','Income', 'NII',            2, 13,0, 1),
+( 5,'Interest Income on Placements', 'PL','Income', 'NII',            2, 14,0, 1),
+( 6,'Interest Expense',              'PL','Expense','NII',            1, 15,1,-1),
+( 7,'Interest Expense on Deposits',  'PL','Expense','NII',            6, 16,0,-1),
+( 8,'Interest Expense on Borrowings','PL','Expense','NII',            6, 17,0,-1),
+
+( 9,'Non-Interest Income',           'PL','Income', 'Non-Interest',NULL, 20,1, 1),
+(10,'Fee & Commission Income',       'PL','Income', 'Non-Interest',   9, 21,0, 1),
+(11,'Trading & Investment Income',   'PL','Income', 'Non-Interest',   9, 22,0, 1),
+(12,'FX Gains',                      'PL','Income', 'Non-Interest',   9, 23,0, 1),
+(13,'Other Non-Interest Income',     'PL','Income', 'Non-Interest',   9, 24,0, 1),
+
+(14,'Operating Expenses',            'PL','Expense','OpEx',        NULL, 30,1,-1),
+(15,'Personnel Expenses',            'PL','Expense','OpEx',          14, 31,0,-1),
+(16,'Administrative Expenses',       'PL','Expense','OpEx',          14, 32,0,-1),
+(17,'Depreciation & Amortization',   'PL','Expense','OpEx',          14, 33,0,-1),
+
+(18,'Provision for Loan Losses',     'PL','Expense','Risk Cost',   NULL, 40,0,-1),
+(19,'Profit Before Tax',             'PL','Subtotal','PBT',        NULL, 50,1, 1),
+(20,'Income Tax Expense',            'PL','Expense','Tax',         NULL, 51,0,-1),
+(21,'Net Income',                    'PL','Subtotal','Bottom Line',NULL, 52,1, 1),
+
+-- ── Balance Sheet: Assets ────────────────────────────────
+(22,'Total Assets',                  'BS','Asset',  'Total',       NULL, 60,1, 1),
+(23,'Cash & Central Bank Balances',  'BS','Asset',  'Liquid',        22, 61,0, 1),
+(24,'Loans to Customers',            'BS','Asset',  'Loans',         22, 62,1, 1),
+(25,'Consumer & Personal Loans',     'BS','Asset',  'Loans',         24, 63,0, 1),
+(26,'Mortgage Loans',                'BS','Asset',  'Loans',         24, 64,0, 1),
+(27,'SME & Corporate Loans',         'BS','Asset',  'Loans',         24, 65,0, 1),
+(28,'Investment Securities',         'BS','Asset',  'Investments',   22, 66,0, 1),
+(29,'Property Plant & Equipment',    'BS','Asset',  'Fixed Assets',  22, 67,0, 1),
+(30,'Other Assets',                  'BS','Asset',  'Other',         22, 68,0, 1),
+
+-- ── Balance Sheet: Liabilities ───────────────────────────
+(31,'Total Liabilities',             'BS','Liability','Total',     NULL, 70,1,-1),
+(32,'Customer Deposits',             'BS','Liability','Deposits',    31, 71,1,-1),
+(33,'Demand Deposits',               'BS','Liability','Deposits',    32, 72,0,-1),
+(34,'Savings Accounts',              'BS','Liability','Deposits',    32, 73,0,-1),
+(35,'Term Deposits',                 'BS','Liability','Deposits',    32, 74,0,-1),
+(36,'Interbank Borrowings',          'BS','Liability','Borrowings',  31, 75,0,-1),
+(37,'Bonds Issued',                  'BS','Liability','Borrowings',  31, 76,0,-1),
+(38,'Other Liabilities',             'BS','Liability','Other',       31, 77,0,-1),
+
+-- ── Balance Sheet: Equity ────────────────────────────────
+(39,'Total Equity',                  'BS','Equity', 'Total',      NULL, 80,1, 1),
+(40,'Share Capital',                 'BS','Equity', 'Capital',      39, 81,0, 1),
+(41,'Retained Earnings',             'BS','Equity', 'Earnings',     39, 82,0, 1),
+(42,'Regulatory Reserves',           'BS','Equity', 'Reserves',     39, 83,0, 1),
+(43,'Other Comprehensive Income',    'BS','Equity', 'Other',        39, 84,0, 1);
+GO
+
+-- =========================================================
+-- 9. VALID PRODUCT-SEGMENT COMBINATIONS
+-- Only realistic combinations allowed
+-- =========================================================
+CREATE TABLE #valid_combos (
+    segment_id INT,
+    product_id INT,
+    currency_id INT
+);
+
+-- RETAIL
+INSERT INTO #valid_combos VALUES
+(1, 1,1),(1, 1,2),                          -- Consumer Loan: GEL, USD
+(1, 2,1),(1, 2,2),                          -- Mortgage: GEL, USD
+(1, 3,1),(1, 3,2),                          -- Auto Loan: GEL, USD
+(1, 7,1),                                   -- Credit Card Classic: GEL
+(1, 9,1),                                   -- Debit Card: GEL
+(1,10,1),(1,11,2),(1,12,3),                 -- Current Accounts: GEL/USD/EUR
+(1,13,1),(1,13,2),                          -- Savings: GEL, USD
+(1,14,1),(1,15,2),                          -- Term Deposits: GEL, USD
+(1,16,1),(1,17,1);                          -- Internet/Mobile: GEL only
+
+-- SME
+INSERT INTO #valid_combos VALUES
+(2, 4,1),(2, 4,2),                          -- Business Loan: GEL, USD
+(2, 5,1),(2, 5,2),                          -- SME Credit Line: GEL, USD
+(2,10,1),(2,11,2),                          -- Current Accounts: GEL, USD
+(2,14,1),                                   -- Term Deposit: GEL
+(2,16,1);                                   -- Internet Banking: GEL
+
+-- CORPORATE
+INSERT INTO #valid_combos VALUES
+(3, 6,1),(3, 6,2),(3, 6,3),                -- Corporate Loan: GEL/USD/EUR
+(3,10,1),(3,11,2),(3,12,3),                -- Current Accounts: GEL/USD/EUR
+(3,14,1),(3,15,2),                          -- Term Deposits: GEL, USD
+(3,16,1);                                   -- Internet Banking: GEL
+
+-- PRIVATE BANKING
+INSERT INTO #valid_combos VALUES
+(4, 2,1),(4, 2,2),                          -- Mortgage: GEL, USD
+(4, 8,1),(4, 8,2),                          -- Credit Card Premium: GEL, USD
+(4, 9,1),                                   -- Debit Card: GEL
+(4,10,1),(4,11,2),(4,12,3),                -- Current Accounts: GEL/USD/EUR
+(4,13,1),(4,13,2),                          -- Savings: GEL, USD
+(4,14,1),(4,15,2),                          -- Term Deposits: GEL, USD
+(4,16,1),(4,17,1);                          -- Internet/Mobile: GEL
+
+-- FINANCIAL INSTITUTIONS
+INSERT INTO #valid_combos VALUES
+(5,10,1),(5,11,2),(5,12,3),                -- Current Accounts: GEL/USD/EUR
+(5,14,1),(5,15,2);                          -- Term Deposits: GEL, USD
+GO
+
+-- =========================================================
+-- 10. fact_financial_data
+-- =========================================================
+CREATE TABLE fact_financial_data (
+    entry_id          BIGINT        IDENTITY PRIMARY KEY,
+    date_id           INT           NOT NULL REFERENCES dim_date(date_id),
+    branch_id         INT           NOT NULL REFERENCES dim_branch(branch_id),
+    segment_id        INT           NOT NULL REFERENCES dim_segment(segment_id),
+    product_id        INT           NOT NULL REFERENCES dim_product(product_id),
+    currency_id       INT           NOT NULL REFERENCES dim_currency(currency_id),
+    scenario_id       INT           NOT NULL REFERENCES dim_scenario(scenario_id),
+    budget_item_id    INT           NOT NULL REFERENCES dim_budget_items(budget_item_id),
+
+    amount_gel        DECIMAL(22,2) NOT NULL DEFAULT 0,
+    amount_nominal    DECIMAL(22,2) NOT NULL DEFAULT 0,
+    daily_avg_gel     DECIMAL(22,2),
+    daily_avg_nominal DECIMAL(22,2),
+    fx_rate           DECIMAL(10,6) NOT NULL DEFAULT 1.000000
 );
 GO
 
-WITH nums AS (
-    SELECT TOP 2000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
-    FROM sys.objects a CROSS JOIN sys.objects b
-)
-INSERT INTO accounts
+-- =========================================================
+-- 11. DATA GENERATION
+-- Inserted scenario by scenario to keep batches manageable
+-- =========================================================
+
+-- Base amount by budget item category and branch type
+-- wrapped in a helper view for reuse
+-- We'll use inline CASE expressions in each INSERT
+
+-- ── SCENARIO 1: Actual_2022 ───────────────────────────────
+INSERT INTO fact_financial_data
+    (date_id, branch_id, segment_id, product_id, currency_id,
+     scenario_id, budget_item_id,
+     amount_gel, amount_nominal, daily_avg_gel, daily_avg_nominal, fx_rate)
 SELECT
-    n AS account_id,
-    n AS customer_id,
-    CASE (n % 4)
-        WHEN 0 THEN 'Checking'
-        WHEN 1 THEN 'Savings'
-        WHEN 2 THEN 'Credit'
-        ELSE 'Loan'
-    END AS account_type,
-    CASE (n % 3)
-        WHEN 0 THEN 'GEL'
-        WHEN 1 THEN 'USD'
-        ELSE 'EUR'
-    END AS currency,
-    DATEADD(DAY, -(n * 3 + 100), GETDATE()) AS opened_date,
-    CAST(ABS(CHECKSUM(NEWID())) % 50000 + 500 AS DECIMAL(18,2)) AS balance,
-    CASE WHEN n % 4 = 2 THEN CAST((ABS(CHECKSUM(NEWID())) % 10000 + 1000) AS DECIMAL(18,2)) ELSE NULL END AS credit_limit,
-    CASE WHEN n % 20 = 0 THEN 0 ELSE 1 END AS is_active
-FROM nums;
-GO
+    d.date_id,
+    b.branch_id,
+    vc.segment_id,
+    vc.product_id,
+    vc.currency_id,
+    1 AS scenario_id,
+    bi.budget_item_id,
 
--- Add second accounts for some customers
-WITH nums AS (
-    SELECT TOP 500 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
-    FROM sys.objects a CROSS JOIN sys.objects b
-)
-INSERT INTO accounts
+    -- amount_gel
+    CAST(ABS(
+        CASE bi.category
+            WHEN 'Income'    THEN 50000
+            WHEN 'Expense'   THEN 30000
+            WHEN 'Asset'     THEN 2000000
+            WHEN 'Liability' THEN 1500000
+            WHEN 'Equity'    THEN 500000
+            ELSE 20000
+        END
+        * CASE b.branch_type
+            WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0
+            WHEN 'Mini'     THEN 0.8 WHEN 'Digital'  THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id
+            WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5
+            WHEN 2 THEN 2.0 ELSE 1.0 END
+        * CASE d.quarter
+            WHEN 1 THEN 0.90 WHEN 2 THEN 0.95
+            WHEN 3 THEN 1.00 WHEN 4 THEN 1.15 ELSE 1.0 END
+        * CASE vc.currency_id
+            WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        + (ABS(CHECKSUM(NEWID())) % 30000 - 15000)
+    ) AS DECIMAL(22,2)) AS amount_gel,
+
+    -- amount_nominal = amount_gel / fx_rate
+    CAST(ABS(
+        CASE bi.category
+            WHEN 'Income'    THEN 50000
+            WHEN 'Expense'   THEN 30000
+            WHEN 'Asset'     THEN 2000000
+            WHEN 'Liability' THEN 1500000
+            WHEN 'Equity'    THEN 500000
+            ELSE 20000
+        END
+        * CASE b.branch_type
+            WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0
+            WHEN 'Mini'     THEN 0.8 WHEN 'Digital'  THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id
+            WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5
+            WHEN 2 THEN 2.0 ELSE 1.0 END
+        * CASE d.quarter
+            WHEN 1 THEN 0.90 WHEN 2 THEN 0.95
+            WHEN 3 THEN 1.00 WHEN 4 THEN 1.15 ELSE 1.0 END
+        * CASE vc.currency_id
+            WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        + (ABS(CHECKSUM(NEWID())) % 30000 - 15000)
+    ) / c.fx_rate_to_gel AS DECIMAL(22,2)) AS amount_nominal,
+
+    -- daily_avg_gel (assets slightly below month-end, liabilities slightly above)
+    CAST(ABS(
+        CASE bi.category
+            WHEN 'Income'    THEN 50000
+            WHEN 'Expense'   THEN 30000
+            WHEN 'Asset'     THEN 2000000
+            WHEN 'Liability' THEN 1500000
+            WHEN 'Equity'    THEN 500000
+            ELSE 20000
+        END
+        * CASE b.branch_type
+            WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0
+            WHEN 'Mini'     THEN 0.8 WHEN 'Digital'  THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id
+            WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5
+            WHEN 2 THEN 2.0 ELSE 1.0 END
+        * CASE d.quarter
+            WHEN 1 THEN 0.90 WHEN 2 THEN 0.95
+            WHEN 3 THEN 1.00 WHEN 4 THEN 1.15 ELSE 1.0 END
+        * CASE vc.currency_id
+            WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        * CASE bi.category
+            WHEN 'Asset'     THEN 0.94   -- growing portfolio, avg < month-end
+            WHEN 'Liability' THEN 1.03   -- deposits peak mid-month
+            ELSE 1.00 END
+        + (ABS(CHECKSUM(NEWID())) % 20000 - 10000)
+    ) AS DECIMAL(22,2)) AS daily_avg_gel,
+
+    -- daily_avg_nominal
+    CAST(ABS(
+        CASE bi.category
+            WHEN 'Income'    THEN 50000
+            WHEN 'Expense'   THEN 30000
+            WHEN 'Asset'     THEN 2000000
+            WHEN 'Liability' THEN 1500000
+            WHEN 'Equity'    THEN 500000
+            ELSE 20000
+        END
+        * CASE b.branch_type
+            WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0
+            WHEN 'Mini'     THEN 0.8 WHEN 'Digital'  THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id
+            WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5
+            WHEN 2 THEN 2.0 ELSE 1.0 END
+        * CASE d.quarter
+            WHEN 1 THEN 0.90 WHEN 2 THEN 0.95
+            WHEN 3 THEN 1.00 WHEN 4 THEN 1.15 ELSE 1.0 END
+        * CASE vc.currency_id
+            WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        * CASE bi.category
+            WHEN 'Asset'     THEN 0.94
+            WHEN 'Liability' THEN 1.03
+            ELSE 1.00 END
+        + (ABS(CHECKSUM(NEWID())) % 20000 - 10000)
+    ) / c.fx_rate_to_gel AS DECIMAL(22,2)) AS daily_avg_nominal,
+
+    c.fx_rate_to_gel AS fx_rate
+
+FROM dim_date d
+CROSS JOIN dim_branch b
+CROSS JOIN #valid_combos vc
+JOIN dim_currency c      ON c.currency_id    = vc.currency_id
+JOIN dim_budget_items bi ON bi.is_subtotal   = 0
+WHERE d.is_month_end = 1
+  AND d.year = 2022;
+GO
+PRINT 'Scenario 1 (Actual_2022) done';
+
+-- ── SCENARIO 2: Actual_2023 ───────────────────────────────
+INSERT INTO fact_financial_data
+    (date_id, branch_id, segment_id, product_id, currency_id,
+     scenario_id, budget_item_id,
+     amount_gel, amount_nominal, daily_avg_gel, daily_avg_nominal, fx_rate)
 SELECT
-    2000 + n AS account_id,
-    n * 4 AS customer_id,
-    CASE (n % 2) WHEN 0 THEN 'Savings' ELSE 'Credit' END AS account_type,
-    'GEL' AS currency,
-    DATEADD(DAY, -(n * 2 + 50), GETDATE()) AS opened_date,
-    CAST(ABS(CHECKSUM(NEWID())) % 20000 + 1000 AS DECIMAL(18,2)) AS balance,
-    NULL AS credit_limit,
-    1 AS is_active
-FROM nums
-WHERE n * 4 <= 2000;
+    d.date_id, b.branch_id, vc.segment_id, vc.product_id, vc.currency_id,
+    2, bi.budget_item_id,
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 50000 WHEN 'Expense' THEN 30000 WHEN 'Asset' THEN 2000000 WHEN 'Liability' THEN 1500000 WHEN 'Equity' THEN 500000 ELSE 20000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.10  -- 10% YoY growth vs 2022
+        * CASE d.quarter WHEN 1 THEN 0.90 WHEN 2 THEN 0.95 WHEN 3 THEN 1.00 WHEN 4 THEN 1.15 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        + (ABS(CHECKSUM(NEWID())) % 30000 - 15000)) AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 50000 WHEN 'Expense' THEN 30000 WHEN 'Asset' THEN 2000000 WHEN 'Liability' THEN 1500000 WHEN 'Equity' THEN 500000 ELSE 20000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.10 * CASE d.quarter WHEN 1 THEN 0.90 WHEN 2 THEN 0.95 WHEN 3 THEN 1.00 WHEN 4 THEN 1.15 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        + (ABS(CHECKSUM(NEWID())) % 30000 - 15000)) / c.fx_rate_to_gel AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 50000 WHEN 'Expense' THEN 30000 WHEN 'Asset' THEN 2000000 WHEN 'Liability' THEN 1500000 WHEN 'Equity' THEN 500000 ELSE 20000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.10 * CASE d.quarter WHEN 1 THEN 0.90 WHEN 2 THEN 0.95 WHEN 3 THEN 1.00 WHEN 4 THEN 1.15 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        * CASE bi.category WHEN 'Asset' THEN 0.94 WHEN 'Liability' THEN 1.03 ELSE 1.00 END
+        + (ABS(CHECKSUM(NEWID())) % 20000 - 10000)) AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 50000 WHEN 'Expense' THEN 30000 WHEN 'Asset' THEN 2000000 WHEN 'Liability' THEN 1500000 WHEN 'Equity' THEN 500000 ELSE 20000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.10 * CASE d.quarter WHEN 1 THEN 0.90 WHEN 2 THEN 0.95 WHEN 3 THEN 1.00 WHEN 4 THEN 1.15 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        * CASE bi.category WHEN 'Asset' THEN 0.94 WHEN 'Liability' THEN 1.03 ELSE 1.00 END
+        + (ABS(CHECKSUM(NEWID())) % 20000 - 10000)) / c.fx_rate_to_gel AS DECIMAL(22,2)),
+    c.fx_rate_to_gel
+FROM dim_date d CROSS JOIN dim_branch b CROSS JOIN #valid_combos vc
+JOIN dim_currency c ON c.currency_id = vc.currency_id
+JOIN dim_budget_items bi ON bi.is_subtotal = 0
+WHERE d.is_month_end = 1 AND d.year = 2023;
 GO
+PRINT 'Scenario 2 (Actual_2023) done';
 
--- ============================================
--- TABLE 4: LOANS
--- ============================================
-CREATE TABLE loans (
-    loan_id             INT PRIMARY KEY,
-    customer_id         INT FOREIGN KEY REFERENCES customers(customer_id),
-    branch_id           INT FOREIGN KEY REFERENCES branches(branch_id),
-    loan_type           NVARCHAR(30),   -- Mortgage, Consumer, Auto, Business
-    principal_amount    DECIMAL(18,2),
-    outstanding_balance DECIMAL(18,2),
-    interest_rate       DECIMAL(5,2),
-    start_date          DATE,
-    maturity_date       DATE,
-    status              NVARCHAR(20),   -- Performing, Non-Performing, Closed
-    days_past_due       INT
-);
-GO
-
-WITH nums AS (
-    SELECT TOP 800 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
-    FROM sys.objects a CROSS JOIN sys.objects b
-)
-INSERT INTO loans
+-- ── SCENARIO 3: Actual_2024 ───────────────────────────────
+INSERT INTO fact_financial_data
+    (date_id, branch_id, segment_id, product_id, currency_id,
+     scenario_id, budget_item_id,
+     amount_gel, amount_nominal, daily_avg_gel, daily_avg_nominal, fx_rate)
 SELECT
-    n AS loan_id,
-    (n * 2) % 2000 + 1 AS customer_id,
-    (n % 5) + 1 AS branch_id,
-    CASE (n % 4)
-        WHEN 0 THEN 'Mortgage'
-        WHEN 1 THEN 'Consumer'
-        WHEN 2 THEN 'Auto'
-        ELSE 'Business'
-    END AS loan_type,
-    CAST((ABS(CHECKSUM(NEWID())) % 90000 + 10000) AS DECIMAL(18,2)) AS principal_amount,
-    CAST((ABS(CHECKSUM(NEWID())) % 80000 + 5000) AS DECIMAL(18,2)) AS outstanding_balance,
-    CAST(CASE (n % 4)
-        WHEN 0 THEN 8.5 + (n % 3)
-        WHEN 1 THEN 18.0 + (n % 5)
-        WHEN 2 THEN 12.0 + (n % 4)
-        ELSE 14.0 + (n % 6)
-    END AS DECIMAL(5,2)) AS interest_rate,
-    DATEADD(MONTH, -(n % 24 + 1), GETDATE()) AS start_date,
-    DATEADD(MONTH, (n % 240 + 12), GETDATE()) AS maturity_date,
-    CASE
-        WHEN n % 12 = 0 THEN 'Non-Performing'
-        WHEN n % 30 = 0 THEN 'Closed'
-        ELSE 'Performing'
-    END AS status,
-    CASE WHEN n % 12 = 0 THEN (n % 90) + 30 ELSE 0 END AS days_past_due
-FROM nums;
+    d.date_id, b.branch_id, vc.segment_id, vc.product_id, vc.currency_id,
+    3, bi.budget_item_id,
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 50000 WHEN 'Expense' THEN 30000 WHEN 'Asset' THEN 2000000 WHEN 'Liability' THEN 1500000 WHEN 'Equity' THEN 500000 ELSE 20000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.21  -- 21% YoY growth vs 2022 (1.1^2)
+        * CASE d.quarter WHEN 1 THEN 0.90 WHEN 2 THEN 0.95 WHEN 3 THEN 1.00 WHEN 4 THEN 1.15 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        + (ABS(CHECKSUM(NEWID())) % 30000 - 15000)) AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 50000 WHEN 'Expense' THEN 30000 WHEN 'Asset' THEN 2000000 WHEN 'Liability' THEN 1500000 WHEN 'Equity' THEN 500000 ELSE 20000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.21 * CASE d.quarter WHEN 1 THEN 0.90 WHEN 2 THEN 0.95 WHEN 3 THEN 1.00 WHEN 4 THEN 1.15 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        + (ABS(CHECKSUM(NEWID())) % 30000 - 15000)) / c.fx_rate_to_gel AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 50000 WHEN 'Expense' THEN 30000 WHEN 'Asset' THEN 2000000 WHEN 'Liability' THEN 1500000 WHEN 'Equity' THEN 500000 ELSE 20000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.21 * CASE d.quarter WHEN 1 THEN 0.90 WHEN 2 THEN 0.95 WHEN 3 THEN 1.00 WHEN 4 THEN 1.15 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        * CASE bi.category WHEN 'Asset' THEN 0.94 WHEN 'Liability' THEN 1.03 ELSE 1.00 END
+        + (ABS(CHECKSUM(NEWID())) % 20000 - 10000)) AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 50000 WHEN 'Expense' THEN 30000 WHEN 'Asset' THEN 2000000 WHEN 'Liability' THEN 1500000 WHEN 'Equity' THEN 500000 ELSE 20000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.21 * CASE d.quarter WHEN 1 THEN 0.90 WHEN 2 THEN 0.95 WHEN 3 THEN 1.00 WHEN 4 THEN 1.15 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        * CASE bi.category WHEN 'Asset' THEN 0.94 WHEN 'Liability' THEN 1.03 ELSE 1.00 END
+        + (ABS(CHECKSUM(NEWID())) % 20000 - 10000)) / c.fx_rate_to_gel AS DECIMAL(22,2)),
+    c.fx_rate_to_gel
+FROM dim_date d CROSS JOIN dim_branch b CROSS JOIN #valid_combos vc
+JOIN dim_currency c ON c.currency_id = vc.currency_id
+JOIN dim_budget_items bi ON bi.is_subtotal = 0
+WHERE d.is_month_end = 1 AND d.year = 2024;
 GO
+PRINT 'Scenario 3 (Actual_2024) done';
 
--- ============================================
--- TABLE 5: TRANSACTIONS
--- ============================================
-CREATE TABLE transactions (
-    transaction_id      BIGINT PRIMARY KEY,
-    account_id          INT FOREIGN KEY REFERENCES accounts(account_id),
-    transaction_date    DATE,
-    transaction_type    NVARCHAR(30),   -- Deposit, Withdrawal, Transfer, Payment, Fee
-    amount              DECIMAL(18,2),
-    direction           CHAR(1),        -- D = Debit, C = Credit
-    description         NVARCHAR(200),
-    channel             NVARCHAR(20)    -- Branch, ATM, Online, Mobile
-);
-GO
-
--- Generate ~24 months of transactions (approx 24000 rows)
-WITH months AS (
-    SELECT TOP 24 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS m
-    FROM sys.objects
-),
-accounts_sample AS (
-    SELECT TOP 1000 account_id FROM accounts WHERE is_active = 1
-),
-combos AS (
-    SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn,
-           a.account_id, m.m
-    FROM accounts_sample a CROSS JOIN months m
-)
-INSERT INTO transactions
+-- ── SCENARIO 4: Budget_2023 ───────────────────────────────
+-- Budget is slightly more optimistic than actuals, tighter variance
+INSERT INTO fact_financial_data
+    (date_id, branch_id, segment_id, product_id, currency_id,
+     scenario_id, budget_item_id,
+     amount_gel, amount_nominal, daily_avg_gel, daily_avg_nominal, fx_rate)
 SELECT
-    rn AS transaction_id,
-    account_id,
-    DATEADD(DAY, (rn % 28), DATEADD(MONTH, -(m - 1), CAST(GETDATE() AS DATE))) AS transaction_date,
-    CASE (rn % 5)
-        WHEN 0 THEN 'Deposit'
-        WHEN 1 THEN 'Withdrawal'
-        WHEN 2 THEN 'Transfer'
-        WHEN 3 THEN 'Payment'
-        ELSE 'Fee'
-    END AS transaction_type,
-    CAST(ABS(CHECKSUM(NEWID())) % 5000 + 10 AS DECIMAL(18,2)) AS amount,
-    CASE WHEN rn % 5 IN (0) THEN 'C' ELSE 'D' END AS direction,
-    CASE (rn % 5)
-        WHEN 0 THEN 'Salary / incoming transfer'
-        WHEN 1 THEN 'ATM cash withdrawal'
-        WHEN 2 THEN 'Bank transfer'
-        WHEN 3 THEN 'Utility / loan payment'
-        ELSE 'Service fee'
-    END AS description,
-    CASE (rn % 4)
-        WHEN 0 THEN 'Branch'
-        WHEN 1 THEN 'ATM'
-        WHEN 2 THEN 'Online'
-        ELSE 'Mobile'
-    END AS channel
-FROM combos;
+    d.date_id, b.branch_id, vc.segment_id, vc.product_id, vc.currency_id,
+    4, bi.budget_item_id,
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 53000 WHEN 'Expense' THEN 28000 WHEN 'Asset' THEN 2100000 WHEN 'Liability' THEN 1550000 WHEN 'Equity' THEN 520000 ELSE 21000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * CASE d.quarter WHEN 1 THEN 0.92 WHEN 2 THEN 0.96 WHEN 3 THEN 1.00 WHEN 4 THEN 1.12 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        + (ABS(CHECKSUM(NEWID())) % 10000 - 5000)) AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 53000 WHEN 'Expense' THEN 28000 WHEN 'Asset' THEN 2100000 WHEN 'Liability' THEN 1550000 WHEN 'Equity' THEN 520000 ELSE 21000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * CASE d.quarter WHEN 1 THEN 0.92 WHEN 2 THEN 0.96 WHEN 3 THEN 1.00 WHEN 4 THEN 1.12 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        + (ABS(CHECKSUM(NEWID())) % 10000 - 5000)) / c.fx_rate_to_gel AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 53000 WHEN 'Expense' THEN 28000 WHEN 'Asset' THEN 2100000 WHEN 'Liability' THEN 1550000 WHEN 'Equity' THEN 520000 ELSE 21000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * CASE d.quarter WHEN 1 THEN 0.92 WHEN 2 THEN 0.96 WHEN 3 THEN 1.00 WHEN 4 THEN 1.12 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        * CASE bi.category WHEN 'Asset' THEN 0.94 WHEN 'Liability' THEN 1.03 ELSE 1.00 END
+        + (ABS(CHECKSUM(NEWID())) % 8000 - 4000)) AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 53000 WHEN 'Expense' THEN 28000 WHEN 'Asset' THEN 2100000 WHEN 'Liability' THEN 1550000 WHEN 'Equity' THEN 520000 ELSE 21000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * CASE d.quarter WHEN 1 THEN 0.92 WHEN 2 THEN 0.96 WHEN 3 THEN 1.00 WHEN 4 THEN 1.12 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        * CASE bi.category WHEN 'Asset' THEN 0.94 WHEN 'Liability' THEN 1.03 ELSE 1.00 END
+        + (ABS(CHECKSUM(NEWID())) % 8000 - 4000)) / c.fx_rate_to_gel AS DECIMAL(22,2)),
+    c.fx_rate_to_gel
+FROM dim_date d CROSS JOIN dim_branch b CROSS JOIN #valid_combos vc
+JOIN dim_currency c ON c.currency_id = vc.currency_id
+JOIN dim_budget_items bi ON bi.is_subtotal = 0
+WHERE d.is_month_end = 1 AND d.year = 2023;
 GO
+PRINT 'Scenario 4 (Budget_2023) done';
 
--- ============================================
--- TABLE 6: FINANCIALS (Monthly P&L)
--- ============================================
-CREATE TABLE financials (
-    financial_id            INT PRIMARY KEY,
-    year_month              CHAR(7),        -- YYYY-MM
-    branch_id               INT FOREIGN KEY REFERENCES branches(branch_id),
-    interest_income         DECIMAL(18,2),
-    interest_expense        DECIMAL(18,2),
-    non_interest_income     DECIMAL(18,2),
-    operating_expenses      DECIMAL(18,2),
-    loan_loss_provisions    DECIMAL(18,2),
-    net_profit              DECIMAL(18,2),
-    total_assets            DECIMAL(18,2),
-    total_deposits          DECIMAL(18,2),
-    total_loans             DECIMAL(18,2),
-    total_equity            DECIMAL(18,2)
-);
-GO
-
-WITH months AS (
-    SELECT TOP 24 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS m
-    FROM sys.objects
-),
-branches_list AS (SELECT branch_id FROM branches),
-combos AS (
-    SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn,
-           b.branch_id, m.m,
-           FORMAT(DATEADD(MONTH, -(m-1), GETDATE()), 'yyyy-MM') AS year_month
-    FROM branches_list b CROSS JOIN months m
-)
-INSERT INTO financials
+-- ── SCENARIO 5: Budget_2024 ───────────────────────────────
+INSERT INTO fact_financial_data
+    (date_id, branch_id, segment_id, product_id, currency_id,
+     scenario_id, budget_item_id,
+     amount_gel, amount_nominal, daily_avg_gel, daily_avg_nominal, fx_rate)
 SELECT
-    rn AS financial_id,
-    year_month,
-    branch_id,
-    CAST(80000 + (branch_id * 5000) + (rn * 200) + ABS(CHECKSUM(NEWID())) % 10000 AS DECIMAL(18,2)) AS interest_income,
-    CAST(20000 + (branch_id * 1000) + ABS(CHECKSUM(NEWID())) % 5000 AS DECIMAL(18,2)) AS interest_expense,
-    CAST(15000 + (branch_id * 2000) + ABS(CHECKSUM(NEWID())) % 3000 AS DECIMAL(18,2)) AS non_interest_income,
-    CAST(40000 + (branch_id * 3000) + ABS(CHECKSUM(NEWID())) % 8000 AS DECIMAL(18,2)) AS operating_expenses,
-    CAST(5000 + ABS(CHECKSUM(NEWID())) % 3000 AS DECIMAL(18,2)) AS loan_loss_provisions,
-    CAST(25000 + (branch_id * 2000) + ABS(CHECKSUM(NEWID())) % 5000 AS DECIMAL(18,2)) AS net_profit,
-    CAST(5000000 + (branch_id * 500000) + (rn * 10000) AS DECIMAL(18,2)) AS total_assets,
-    CAST(3000000 + (branch_id * 300000) + (rn * 5000) AS DECIMAL(18,2)) AS total_deposits,
-    CAST(2000000 + (branch_id * 200000) + (rn * 3000) AS DECIMAL(18,2)) AS total_loans,
-    CAST(800000 + (branch_id * 80000) AS DECIMAL(18,2)) AS total_equity
-FROM combos;
+    d.date_id, b.branch_id, vc.segment_id, vc.product_id, vc.currency_id,
+    5, bi.budget_item_id,
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 53000 WHEN 'Expense' THEN 28000 WHEN 'Asset' THEN 2100000 WHEN 'Liability' THEN 1550000 WHEN 'Equity' THEN 520000 ELSE 21000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.12
+        * CASE d.quarter WHEN 1 THEN 0.92 WHEN 2 THEN 0.96 WHEN 3 THEN 1.00 WHEN 4 THEN 1.12 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        + (ABS(CHECKSUM(NEWID())) % 10000 - 5000)) AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 53000 WHEN 'Expense' THEN 28000 WHEN 'Asset' THEN 2100000 WHEN 'Liability' THEN 1550000 WHEN 'Equity' THEN 520000 ELSE 21000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.12 * CASE d.quarter WHEN 1 THEN 0.92 WHEN 2 THEN 0.96 WHEN 3 THEN 1.00 WHEN 4 THEN 1.12 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        + (ABS(CHECKSUM(NEWID())) % 10000 - 5000)) / c.fx_rate_to_gel AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 53000 WHEN 'Expense' THEN 28000 WHEN 'Asset' THEN 2100000 WHEN 'Liability' THEN 1550000 WHEN 'Equity' THEN 520000 ELSE 21000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.12 * CASE d.quarter WHEN 1 THEN 0.92 WHEN 2 THEN 0.96 WHEN 3 THEN 1.00 WHEN 4 THEN 1.12 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        * CASE bi.category WHEN 'Asset' THEN 0.94 WHEN 'Liability' THEN 1.03 ELSE 1.00 END
+        + (ABS(CHECKSUM(NEWID())) % 8000 - 4000)) AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 53000 WHEN 'Expense' THEN 28000 WHEN 'Asset' THEN 2100000 WHEN 'Liability' THEN 1550000 WHEN 'Equity' THEN 520000 ELSE 21000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.12 * CASE d.quarter WHEN 1 THEN 0.92 WHEN 2 THEN 0.96 WHEN 3 THEN 1.00 WHEN 4 THEN 1.12 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        * CASE bi.category WHEN 'Asset' THEN 0.94 WHEN 'Liability' THEN 1.03 ELSE 1.00 END
+        + (ABS(CHECKSUM(NEWID())) % 8000 - 4000)) / c.fx_rate_to_gel AS DECIMAL(22,2)),
+    c.fx_rate_to_gel
+FROM dim_date d CROSS JOIN dim_branch b CROSS JOIN #valid_combos vc
+JOIN dim_currency c ON c.currency_id = vc.currency_id
+JOIN dim_budget_items bi ON bi.is_subtotal = 0
+WHERE d.is_month_end = 1 AND d.year = 2024;
+GO
+PRINT 'Scenario 5 (Budget_2024) done';
+
+-- ── SCENARIO 6: Budget_2025 ───────────────────────────────
+INSERT INTO fact_financial_data
+    (date_id, branch_id, segment_id, product_id, currency_id,
+     scenario_id, budget_item_id,
+     amount_gel, amount_nominal, daily_avg_gel, daily_avg_nominal, fx_rate)
+SELECT
+    d.date_id, b.branch_id, vc.segment_id, vc.product_id, vc.currency_id,
+    6, bi.budget_item_id,
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 53000 WHEN 'Expense' THEN 28000 WHEN 'Asset' THEN 2100000 WHEN 'Liability' THEN 1550000 WHEN 'Equity' THEN 520000 ELSE 21000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.25
+        * CASE d.quarter WHEN 1 THEN 0.92 WHEN 2 THEN 0.96 WHEN 3 THEN 1.00 WHEN 4 THEN 1.12 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        + (ABS(CHECKSUM(NEWID())) % 10000 - 5000)) AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 53000 WHEN 'Expense' THEN 28000 WHEN 'Asset' THEN 2100000 WHEN 'Liability' THEN 1550000 WHEN 'Equity' THEN 520000 ELSE 21000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.25 * CASE d.quarter WHEN 1 THEN 0.92 WHEN 2 THEN 0.96 WHEN 3 THEN 1.00 WHEN 4 THEN 1.12 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        + (ABS(CHECKSUM(NEWID())) % 10000 - 5000)) / c.fx_rate_to_gel AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 53000 WHEN 'Expense' THEN 28000 WHEN 'Asset' THEN 2100000 WHEN 'Liability' THEN 1550000 WHEN 'Equity' THEN 520000 ELSE 21000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.25 * CASE d.quarter WHEN 1 THEN 0.92 WHEN 2 THEN 0.96 WHEN 3 THEN 1.00 WHEN 4 THEN 1.12 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        * CASE bi.category WHEN 'Asset' THEN 0.94 WHEN 'Liability' THEN 1.03 ELSE 1.00 END
+        + (ABS(CHECKSUM(NEWID())) % 8000 - 4000)) AS DECIMAL(22,2)),
+    CAST(ABS(CASE bi.category WHEN 'Income' THEN 53000 WHEN 'Expense' THEN 28000 WHEN 'Asset' THEN 2100000 WHEN 'Liability' THEN 1550000 WHEN 'Equity' THEN 520000 ELSE 21000 END
+        * CASE b.branch_type WHEN 'Flagship' THEN 3.0 WHEN 'Standard' THEN 2.0 WHEN 'Mini' THEN 0.8 WHEN 'Digital' THEN 1.5 ELSE 1.0 END
+        * CASE vc.segment_id WHEN 3 THEN 4.0 WHEN 4 THEN 3.0 WHEN 5 THEN 2.5 WHEN 2 THEN 2.0 ELSE 1.0 END
+        * 1.25 * CASE d.quarter WHEN 1 THEN 0.92 WHEN 2 THEN 0.96 WHEN 3 THEN 1.00 WHEN 4 THEN 1.12 ELSE 1.0 END
+        * CASE vc.currency_id WHEN 1 THEN 1.00 WHEN 2 THEN 0.40 WHEN 3 THEN 0.20 ELSE 1.0 END
+        * CASE bi.category WHEN 'Asset' THEN 0.94 WHEN 'Liability' THEN 1.03 ELSE 1.00 END
+        + (ABS(CHECKSUM(NEWID())) % 8000 - 4000)) / c.fx_rate_to_gel AS DECIMAL(22,2)),
+    c.fx_rate_to_gel
+FROM dim_date d CROSS JOIN dim_branch b CROSS JOIN #valid_combos vc
+JOIN dim_currency c ON c.currency_id = vc.currency_id
+JOIN dim_budget_items bi ON bi.is_subtotal = 0
+WHERE d.is_month_end = 1 AND d.year = 2025;
+GO
+PRINT 'Scenario 6 (Budget_2025) done';
+
+-- =========================================================
+-- CLEANUP
+-- =========================================================
+DROP TABLE #valid_combos;
 GO
 
--- ============================================
--- VERIFY - Quick row counts
--- ============================================
-SELECT 'branches'     AS tbl, COUNT(*) AS rows FROM branches     UNION ALL
-SELECT 'customers',           COUNT(*)          FROM customers    UNION ALL
-SELECT 'accounts',            COUNT(*)          FROM accounts     UNION ALL
-SELECT 'loans',               COUNT(*)          FROM loans        UNION ALL
-SELECT 'transactions',        COUNT(*)          FROM transactions UNION ALL
-SELECT 'financials',          COUNT(*)          FROM financials;
+-- =========================================================
+-- INDEXES
+-- =========================================================
+CREATE INDEX idx_fd_date        ON fact_financial_data(date_id);
+CREATE INDEX idx_fd_branch      ON fact_financial_data(branch_id);
+CREATE INDEX idx_fd_segment     ON fact_financial_data(segment_id);
+CREATE INDEX idx_fd_product     ON fact_financial_data(product_id);
+CREATE INDEX idx_fd_currency    ON fact_financial_data(currency_id);
+CREATE INDEX idx_fd_scenario    ON fact_financial_data(scenario_id);
+CREATE INDEX idx_fd_budget_item ON fact_financial_data(budget_item_id);
 GO
 
-PRINT 'Imaginary Bank database created successfully!';
+-- =========================================================
+-- VALIDATION
+-- =========================================================
+SELECT 'dim_date'         AS tbl, COUNT(*) AS rows FROM dim_date         UNION ALL
+SELECT 'dim_branch',               COUNT(*)         FROM dim_branch       UNION ALL
+SELECT 'dim_segment',              COUNT(*)         FROM dim_segment      UNION ALL
+SELECT 'dim_product',              COUNT(*)         FROM dim_product      UNION ALL
+SELECT 'dim_currency',             COUNT(*)         FROM dim_currency     UNION ALL
+SELECT 'dim_scenario',             COUNT(*)         FROM dim_scenario     UNION ALL
+SELECT 'dim_budget_items',         COUNT(*)         FROM dim_budget_items UNION ALL
+SELECT 'fact_financial_data',      COUNT(*)         FROM fact_financial_data;
+
+-- Scenario breakdown
+SELECT s.scenario_name, s.scenario_type, COUNT(*) AS rows
+FROM fact_financial_data f
+JOIN dim_scenario s ON f.scenario_id = s.scenario_id
+GROUP BY s.scenario_name, s.scenario_type
+ORDER BY s.scenario_name;
+
+-- Product-segment check (should only show valid combos)
+SELECT seg.segment_name, p.product_name, COUNT(*) AS rows
+FROM fact_financial_data f
+JOIN dim_segment seg ON f.segment_id = seg.segment_id
+JOIN dim_product p   ON f.product_id = p.product_id
+GROUP BY seg.segment_name, p.product_name
+ORDER BY seg.segment_name, p.product_name;
+
+PRINT '================================================';
+PRINT 'Imaginary Bank v4.0 - Complete!';
+PRINT 'Single fact | Star schema | Realistic combos';
+PRINT '================================================';
 GO
